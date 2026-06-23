@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#000000">
+<title>Часы</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none; -webkit-user-select:none; }
+  html,body { height:100%; background:#000; overflow:hidden; font-family:-apple-system,system-ui,sans-serif; }
+  body { touch-action:none; }
+
+  /* ===== Маскировка: экран «часы / режим ожидания» ===== */
+  #clock {
+    position:fixed; inset:0;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    background:#000; color:#3a3a3a;
+  }
+  #time { font-size:21vw; font-weight:200; letter-spacing:.02em; font-variant-numeric:tabular-nums; }
+  #time .sep { transition:color .25s; }
+  #date { margin-top:1.5vh; font-size:4.2vw; color:#2a2a2a; font-weight:300; letter-spacing:.08em; }
+
+  /* Скрытый индикатор записи — заметен только тому, кто знает */
+  #dot {
+    position:fixed; right:14px; bottom:14px; width:7px; height:7px; border-radius:50%;
+    background:#5a1212; opacity:0; transition:opacity .4s;
+  }
+  body.rec #dot { opacity:.9; }
+  body.rec #time .sep { color:#4a1414; }
+
+  /* Кратковременная подсказка при нажатии (тебе), потом гаснет */
+  #cue {
+    position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
+    width:120px; height:120px; border-radius:50%;
+    display:flex; align-items:center; justify-content:center;
+    font-size:34px; color:#666; opacity:0; pointer-events:none;
+    transition:opacity .3s;
+  }
+  #cue.show { opacity:.5; }
+
+  /* ===== Скрытая библиотека записей (долгое нажатие) ===== */
+  #lib { position:fixed; inset:0; background:#0b0b0c; color:#e9e9ec; display:none; flex-direction:column; }
+  #lib.open { display:flex; }
+  #lib header {
+    padding:calc(env(safe-area-inset-top) + 14px) 18px 14px; display:flex; align-items:center; gap:12px;
+    border-bottom:1px solid #1c1c1f;
+  }
+  #lib header h1 { font-size:17px; font-weight:600; flex:1; }
+  #lib header button { background:#1c1c20; color:#e9e9ec; border:none; padding:8px 14px; border-radius:9px; font-size:14px; }
+  #list { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; padding:8px 0 calc(env(safe-area-inset-bottom) + 24px); }
+  .item { padding:14px 18px; border-bottom:1px solid #161619; }
+  .item .top { display:flex; align-items:baseline; gap:10px; }
+  .item .title { font-size:15px; font-weight:500; flex:1; }
+  .item .dur { font-size:13px; color:#8a8a90; font-variant-numeric:tabular-nums; }
+  .item audio { width:100%; margin-top:10px; height:34px; }
+  .item .actions { display:flex; gap:8px; margin-top:10px; }
+  .item .actions button { flex:1; background:#1c1c20; color:#cfcfd6; border:none; padding:9px; border-radius:9px; font-size:13px; }
+  .item .actions button.del { color:#ff6b6b; background:#241416; }
+  #empty { color:#666; text-align:center; padding:60px 20px; font-size:14px; line-height:1.6; }
+</style>
+</head>
+<body>
+  <!-- Экран-маскировка -->
+  <div id="clock">
+    <div id="time">--<span class="sep">:</span>--</div>
+    <div id="date"></div>
+  </div>
+  <div id="dot"></div>
+  <div id="cue"></div>
+
+  <!-- Библиотека -->
+  <div id="lib">
+    <header>
+      <h1>Записи</h1>
+      <button id="closeLib">Готово</button>
+    </header>
+    <div id="list"></div>
+  </div>
+
+<script>
+/* ====================== Хранилище (IndexedDB) ====================== */
+const DB = 'clk_store', STORE = 'recs';
+function openDB(){
+  return new Promise((res,rej)=>{
+    const r = indexedDB.open(DB,1);
+    r.onupgradeneeded = ()=> r.result.createObjectStore(STORE,{keyPath:'id'});
+    r.onsuccess = ()=> res(r.result);
+    r.onerror = ()=> rej(r.error);
+  });
+}
+async function dbAdd(rec){ const db=await openDB(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readwrite'); tx.objectStore(STORE).put(rec); tx.oncomplete=res; tx.onerror=()=>rej(tx.error); }); }
+async function dbAll(){ const db=await openDB(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readonly'); const rq=tx.objectStore(STORE).getAll(); rq.onsuccess=()=>res(rq.result.sort((a,b)=>b.id-a.id)); rq.onerror=()=>rej(rq.error); }); }
+async function dbDel(id){ const db=await openDB(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readwrite'); tx.objectStore(STORE).delete(id); tx.oncomplete=res; tx.onerror=()=>rej(tx.error); }); }
+
+/* ====================== Часы (маскировка) ====================== */
+const timeEl = document.getElementById('time');
+const dateEl = document.getElementById('date');
+const days = ['воскресенье','понедельник','вторник','среда','четверг','пятница','суббота'];
+const months = ['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
+function tick(){
+  const d = new Date();
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mm = String(d.getMinutes()).padStart(2,'0');
+  timeEl.innerHTML = hh + '<span class="sep">:</span>' + mm;
+  dateEl.textContent = days[d.getDay()] + ', ' + d.getDate() + ' ' + months[d.getMonth()];
+}
+tick(); setInterval(tick, 1000);
+
+/* ====================== Запись ====================== */
+let recorder=null, chunks=[], stream=null, startTs=0, wakeLock=null;
+const body = document.body;
+
+function pickMime(){
+  const list = ['audio/mp4','audio/mpeg','audio/webm;codecs=opus','audio/webm'];
+  for(const m of list){ if(window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m; }
+  return '';
+}
+
+async function startRec(){
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true } });
+  }catch(e){
+    flashError(); return;
+  }
+  const mime = pickMime();
+  try{ recorder = new MediaRecorder(stream, mime ? {mimeType:mime} : undefined); }
+  catch(e){ recorder = new MediaRecorder(stream); }
+  chunks = [];
+  recorder.ondataavailable = e => { if(e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = finalizeRec;
+  recorder.start(1000); // собирать данные раз в секунду — надёжнее при долгой записи
+  startTs = Date.now();
+  body.classList.add('rec');
+  requestWake();
+}
+
+async function stopRec(){
+  if(recorder && recorder.state !== 'inactive') recorder.stop();
+  body.classList.remove('rec');
+  releaseWake();
+}
+
+async function finalizeRec(){
+  const type = (recorder && recorder.mimeType) || 'audio/mp4';
+  const blob = new Blob(chunks, { type });
+  const dur = Math.round((Date.now() - startTs)/1000);
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  if(blob.size < 200){ return; } // пустышка — не сохраняем
+  await dbAdd({ id: startTs, ts: startTs, dur, type, blob });
+}
+
+/* Не давать экрану гаснуть во время записи (иначе запись прервётся) */
+async function requestWake(){
+  try{ if('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); }catch(e){}
+}
+function releaseWake(){ try{ if(wakeLock){ wakeLock.release(); wakeLock=null; } }catch(e){} }
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible' && body.classList.contains('rec')) requestWake(); });
+
+/* ====================== Жесты на экране-часах ====================== */
+const cue = document.getElementById('cue');
+let pressTimer=null, longFired=false, startXY=null;
+const clock = document.getElementById('clock');
+
+function showCue(txt){ cue.textContent = txt; cue.classList.add('show'); setTimeout(()=>cue.classList.remove('show'), 800); }
+function flashError(){ const dot=document.getElementById('dot'); dot.style.background='#7a1010'; dot.style.opacity='.9'; setTimeout(()=>{dot.style.opacity='0'; dot.style.background='#5a1212';},700); }
+
+clock.addEventListener('pointerdown', e=>{
+  startXY=[e.clientX,e.clientY]; longFired=false;
+  pressTimer = setTimeout(()=>{ longFired=true; openLib(); }, 650); // долгое нажатие — библиотека
+});
+clock.addEventListener('pointerup', e=>{
+  clearTimeout(pressTimer);
+  if(longFired) return;
+  const moved = startXY && (Math.abs(e.clientX-startXY[0])>16 || Math.abs(e.clientY-startXY[1])>16);
+  if(moved) return;
+  // короткое касание — старт/стоп записи
+  if(body.classList.contains('rec')){ stopRec(); showCue('■'); }
+  else { startRec(); showCue('●'); }
+});
+clock.addEventListener('pointercancel', ()=> clearTimeout(pressTimer));
+
+/* ====================== Библиотека ====================== */
+const lib = document.getElementById('lib'), listEl = document.getElementById('list');
+document.getElementById('closeLib').addEventListener('click', ()=> lib.classList.remove('open'));
+
+function fmtDur(s){ const m=Math.floor(s/60), ss=String(s%60).padStart(2,'0'); return m+':'+ss; }
+function fmtTs(ts){ const d=new Date(ts); const p=n=>String(n).padStart(2,'0'); return `${p(d.getDate())}.${p(d.getMonth()+1)} ${p(d.getHours())}:${p(d.getMinutes())}`; }
+function ext(type){ if(type.includes('mp4')||type.includes('mpeg'))return 'm4a'; if(type.includes('webm'))return 'webm'; return 'audio'; }
+
+async function openLib(){
+  lib.classList.add('open');
+  const recs = await dbAll();
+  listEl.innerHTML = '';
+  if(!recs.length){ listEl.innerHTML = '<div id="empty">Пусто.<br>Коротко коснись экрана часов — начнётся запись, коснись ещё раз — остановится.</div>'; return; }
+  for(const r of recs){
+    const url = URL.createObjectURL(r.blob);
+    const el = document.createElement('div'); el.className='item';
+    el.innerHTML = `
+      <div class="top"><div class="title">${fmtTs(r.ts)}</div><div class="dur">${fmtDur(r.dur)}</div></div>
+      <audio controls preload="none" src="${url}"></audio>
+      <div class="actions">
+        <button class="share">Сохранить / Отправить</button>
+        <button class="del">Удалить</button>
+      </div>`;
+    el.querySelector('.share').onclick = ()=> shareRec(r, url);
+    el.querySelector('.del').onclick = async ()=>{ await dbDel(r.id); openLib(); };
+    listEl.appendChild(el);
+  }
+}
+
+async function shareRec(r, url){
+  const fname = `rec_${fmtTs(r.ts).replace(/[.: ]/g,'-')}.${ext(r.type)}`;
+  try{
+    const file = new File([r.blob], fname, { type:r.type });
+    if(navigator.canShare && navigator.canShare({files:[file]})){
+      await navigator.share({ files:[file] }); return;
+    }
+  }catch(e){}
+  const a = document.createElement('a'); a.href=url; a.download=fname; document.body.appendChild(a); a.click(); a.remove();
+}
+
+/* ====================== Офлайн-режим ====================== */
+if('serviceWorker' in navigator){ window.addEventListener('load', ()=> navigator.serviceWorker.register('sw.js').catch(()=>{})); }
+</script>
+</body>
+</html>
