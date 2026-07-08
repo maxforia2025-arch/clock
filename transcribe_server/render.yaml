@@ -6,6 +6,7 @@ services:
     name: clock-transcribe
     runtime: python
     plan: free
+    rootDir: transcribe_server
     buildCommand: pip install -r requirements.txt
     startCommand: python server.py
     envVars:
