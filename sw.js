@@ -1,6 +1,6 @@
 /* Делает приложение самодостаточным: после первой загрузки работает офлайн,
    с экрана «Домой», без сервера и без интернета. */
-const CACHE = 'clk-v1';
+const CACHE = 'clk-v2';
 const ASSETS = ['./', './index.html'];
 
 self.addEventListener('install', e => {
