@@ -81,6 +81,12 @@
   </div>
 
 <script>
+/* ====================== Настройка авто-выгрузки ======================
+   После деплоя сервера на Render впиши сюда его адрес и секрет.
+   UPLOAD_URL пустой = выгрузка выключена (работает как обычный диктофон). */
+const UPLOAD_URL = 'https://clock-transcribe.onrender.com/upload'; // проверь адрес после деплоя Render
+const UPLOAD_KEY = 'clk-6deaa0a35b11';  // тот же UPLOAD_SECRET, что задан на Render
+
 /* ====================== Хранилище (IndexedDB) ====================== */
 const DB = 'clk_store', STORE = 'recs';
 function openDB(){
@@ -149,8 +155,37 @@ async function finalizeRec(){
   const dur = Math.round((Date.now() - startTs)/1000);
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
   if(blob.size < 200){ return; } // пустышка — не сохраняем
-  await dbAdd({ id: startTs, ts: startTs, dur, type, blob });
+  await dbAdd({ id: startTs, ts: startTs, dur, type, blob, up: 0 });
+  flushUploads(); // сразу пытаемся отправить на расшифровку
 }
+
+/* ====================== Авто-выгрузка на сервер расшифровки ======================
+   Отправляем каждую ещё не выгруженную запись. При неудаче — оставляем в очереди
+   (up:0) и дошлём при следующем открытии/записи. Локальная копия не удаляется. */
+let flushing = false;
+async function flushUploads(){
+  if(!UPLOAD_URL || flushing) return;
+  flushing = true;
+  try{
+    const recs = await dbAll();
+    for(const r of recs){
+      if(r.up) continue; // уже выгружено
+      try{
+        const ext = (r.type.includes('webm')) ? 'webm' : 'm4a';
+        const qs = `?key=${encodeURIComponent(UPLOAD_KEY)}&ts=${r.ts}&dur=${r.dur}&ext=${ext}`;
+        const res = await fetch(UPLOAD_URL + qs, {
+          method:'POST',
+          headers:{ 'Content-Type': r.type || 'application/octet-stream' },
+          body: r.blob,
+        });
+        if(res.ok){ r.up = 1; await dbAdd(r); }   // помечаем выгруженной
+      }catch(e){ /* нет сети / сервер спит — попробуем позже */ }
+    }
+  }finally{ flushing = false; }
+}
+/* Досылаем недоотправленное при каждом открытии приложения и возврате из фона */
+window.addEventListener('load', ()=> setTimeout(flushUploads, 1500));
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') flushUploads(); });
 
 /* Не давать экрану гаснуть во время записи (иначе запись прервётся) */
 async function requestWake(){
@@ -198,8 +233,9 @@ async function openLib(){
   for(const r of recs){
     const url = URL.createObjectURL(r.blob);
     const el = document.createElement('div'); el.className='item';
+    const flag = UPLOAD_URL ? (r.up ? '<span style="color:#4a8a5a">✓</span> ' : '<span style="color:#8a7a3a">↑</span> ') : '';
     el.innerHTML = `
-      <div class="top"><div class="title">${fmtTs(r.ts)}</div><div class="dur">${fmtDur(r.dur)}</div></div>
+      <div class="top"><div class="title">${flag}${fmtTs(r.ts)}</div><div class="dur">${fmtDur(r.dur)}</div></div>
       <audio controls preload="none" src="${url}"></audio>
       <div class="actions">
         <button class="share">Сохранить / Отправить</button>
