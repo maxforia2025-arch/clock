@@ -1,0 +1,31 @@
+# Render Blueprint — ДОЛЖЕН лежать в КОРНЕ репозитория (Render ищет его тут).
+# Сам код сервера — в подпапке transcribe_server (rootDir ниже).
+# В дашборде Render: New → Blueprint → выбрать репозиторий `clock`.
+# Значения с sync:false Render спросит при деплое (в git НЕ попадают).
+services:
+  - type: web
+    name: clock-transcribe
+    runtime: python
+    plan: free
+    rootDir: transcribe_server
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      # Два реально секретных ключа Render спросит при деплое:
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      # Эти не секретны (chat_id и upload-ключ и так видны в публичном PWA):
+      - key: TELEGRAM_CHAT_ID
+        value: "542246142"
+      - key: UPLOAD_SECRET
+        value: clk-6deaa0a35b11
+      - key: SEND_AUDIO
+        value: "1"
+      - key: STT_LANGUAGE
+        value: rus
+      - key: HOST
+        value: 0.0.0.0
+      - key: PYTHON_VERSION
+        value: 3.11.9
