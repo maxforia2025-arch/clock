@@ -252,6 +252,7 @@ class Handler(BaseHTTPRequestHandler):
         ts = q.get("ts", [""])[0]
         dur = q.get("dur", [""])[0]
         ext = q.get("ext", ["m4a"])[0]
+        part = q.get("part", ["1"])[0]
         filename = "rec_%s.%s" % (ts or "x", ext)
 
         # 1) расшифровка
@@ -269,10 +270,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(502, {"error": "scribe: %s" % e})
 
         # 2) в Telegram
+        meta = [x for x in (human_dt(ts), human_dur(dur)) if x]
+        # часть > 1 = запись прерывалась (экран гас) и продолжилась новым куском
+        try:
+            if int(part) > 1:
+                meta.append("часть %d" % int(part))
+        except ValueError:
+            pass
         head = "🎙 Запись"
-        meta = " · ".join([x for x in (human_dt(ts), human_dur(dur)) if x])
         if meta:
-            head += "  (" + meta + ")"
+            head += "  (" + " · ".join(meta) + ")"
 
         try:
             if not text:

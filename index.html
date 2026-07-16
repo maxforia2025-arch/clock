@@ -40,6 +40,7 @@
     transition:opacity .3s;
   }
   #cue.show { opacity:.5; }
+  #cue.num { font-size:22px; font-variant-numeric:tabular-nums; letter-spacing:.04em; }
 
   /* ===== Скрытая библиотека записей (долгое нажатие) ===== */
   #lib { position:fixed; inset:0; background:#0b0b0c; color:#e9e9ec; display:none; flex-direction:column; }
@@ -99,6 +100,7 @@ function openDB(){
 }
 async function dbAdd(rec){ const db=await openDB(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readwrite'); tx.objectStore(STORE).put(rec); tx.oncomplete=res; tx.onerror=()=>rej(tx.error); }); }
 async function dbAll(){ const db=await openDB(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readonly'); const rq=tx.objectStore(STORE).getAll(); rq.onsuccess=()=>res(rq.result.sort((a,b)=>b.id-a.id)); rq.onerror=()=>rej(rq.error); }); }
+async function dbGet(id){ const db=await openDB(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readonly'); const rq=tx.objectStore(STORE).get(id); rq.onsuccess=()=>res(rq.result||null); rq.onerror=()=>rej(rq.error); }); }
 async function dbDel(id){ const db=await openDB(); return new Promise((res,rej)=>{ const tx=db.transaction(STORE,'readwrite'); tx.objectStore(STORE).delete(id); tx.oncomplete=res; tx.onerror=()=>rej(tx.error); }); }
 
 /* ====================== Часы (маскировка) ====================== */
@@ -115,8 +117,21 @@ function tick(){
 }
 tick(); setInterval(tick, 1000);
 
-/* ====================== Запись ====================== */
-let recorder=null, chunks=[], stream=null, startTs=0, wakeLock=null;
+/* ====================== Запись ======================
+   iOS глушит микрофон, как только страница уходит с экрана: блокировка экрана,
+   переход в другое приложение, входящий звонок, Siri. Это ограничение Apple,
+   из веб-приложения его не обойти. Поэтому здесь:
+     • длительность считается по реально пришедшим данным, а не по настенным
+       часам — иначе счётчик засчитывает и то время, когда микрофон был заглушен;
+     • обрыв ловится (watchdog + track.onmute/onended) и часть закрывается
+       сразу, так что файл всегда валидный и записанное не теряется;
+     • при возврате на экран сессия сама продолжается следующей частью. */
+const TIMESLICE = 1000;   // данные раз в секунду
+const STALL_MS  = 5000;   // столько тишины в потоке = микрофон отобрали
+
+let recorder=null, chunks=[], stream=null, track=null;
+let startTs=0, lastDataTs=0, wakeLock=null, watchdog=null;
+let sessionId=0, partNo=0, sessionMs=0, wantRec=false, starting=false;
 const body = document.body;
 
 function pickMime(){
@@ -125,38 +140,77 @@ function pickMime(){
   return '';
 }
 
-async function startRec(){
-  try{
-    stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true } });
-  }catch(e){
-    flashError(); return;
-  }
-  const mime = pickMime();
-  try{ recorder = new MediaRecorder(stream, mime ? {mimeType:mime} : undefined); }
-  catch(e){ recorder = new MediaRecorder(stream); }
-  chunks = [];
-  recorder.ondataavailable = e => { if(e.data && e.data.size) chunks.push(e.data); };
-  recorder.onstop = finalizeRec;
-  recorder.start(1000); // собирать данные раз в секунду — надёжнее при долгой записи
-  startTs = Date.now();
-  body.classList.add('rec');
-  requestWake();
-}
-
-async function stopRec(){
-  if(recorder && recorder.state !== 'inactive') recorder.stop();
-  body.classList.remove('rec');
-  releaseWake();
-}
-
-async function finalizeRec(){
-  const type = (recorder && recorder.mimeType) || 'audio/mp4';
-  const blob = new Blob(chunks, { type });
-  const dur = Math.round((Date.now() - startTs)/1000);
+function cleanupStream(){
+  if(track){ track.onended=null; track.onmute=null; track=null; }
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
-  if(blob.size < 200){ return; } // пустышка — не сохраняем
-  await dbAdd({ id: startTs, ts: startTs, dur, type, blob, up: 0 });
-  flushUploads(); // сразу пытаемся отправить на расшифровку
+}
+
+/* Данные перестали идти — поток мёртв, закрываем часть, не дожидаясь стопа */
+function startWatchdog(){
+  stopWatchdog();
+  watchdog = setInterval(()=>{
+    if(recorder && recorder.state==='recording' && Date.now()-lastDataTs > STALL_MS) cutPart();
+  }, 1000);
+}
+function stopWatchdog(){ if(watchdog){ clearInterval(watchdog); watchdog=null; } }
+function cutPart(){
+  stopWatchdog();
+  if(recorder && recorder.state !== 'inactive'){ try{ recorder.stop(); }catch(e){ cleanupStream(); } }
+  else cleanupStream();
+}
+
+async function startRec(fresh){
+  if(starting || (recorder && recorder.state === 'recording')) return;
+  starting = true;
+  try{
+    wantRec = true;
+    if(fresh){ sessionId = Date.now(); partNo = 0; sessionMs = 0; }
+    try{
+      stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true } });
+    }catch(e){
+      wantRec=false; body.classList.remove('rec'); releaseWake(); flashError(); return;
+    }
+    track = stream.getAudioTracks()[0] || null;
+    const mime = pickMime();
+    try{ recorder = new MediaRecorder(stream, mime ? {mimeType:mime} : undefined); }
+    catch(e){ recorder = new MediaRecorder(stream); }
+    chunks = []; partNo++;
+    startTs = lastDataTs = Date.now();
+    recorder.ondataavailable = e => { if(e.data && e.data.size){ chunks.push(e.data); lastDataTs = Date.now(); } };
+    recorder.onstop  = finalizeRec;
+    recorder.onerror = cutPart;
+    if(track){ track.onended = cutPart; track.onmute = cutPart; }   // микрофон отобрали
+    recorder.start(TIMESLICE);
+    body.classList.add('rec');
+    requestWake();
+    startWatchdog();
+  } finally { starting = false; }
+}
+
+function stopRec(){
+  wantRec = false;
+  stopWatchdog();
+  if(recorder && recorder.state !== 'inactive'){ try{ recorder.stop(); }catch(e){} }  // → finalizeRec
+  else { cleanupStream(); body.classList.remove('rec'); releaseWake(); showCue(fmtDur(Math.round(sessionMs/1000)), true); }
+}
+
+/* onstop: всё снимаем синхронно, чтобы сразу можно было поднять следующую часть */
+function finalizeRec(){
+  const type  = (recorder && recorder.mimeType) || 'audio/mp4';
+  const parts = chunks; chunks = [];
+  const sTs = startTs, sess = sessionId, pNo = partNo;
+  const dur = Math.max(0, Math.round((lastDataTs - sTs)/1000)); // ← по факту звука, не по настенным часам
+  stopWatchdog();
+  cleanupStream();
+  sessionMs += Math.max(0, lastDataTs - sTs);
+
+  const blob = new Blob(parts, { type });
+  if(blob.size >= 200 && dur >= 1){
+    dbAdd({ id:sTs, ts:sTs, dur, type, blob, up:0, sess, part:pNo }).then(flushUploads);
+  }
+
+  if(wantRec && document.visibilityState === 'visible'){ startRec(false); }  // продолжаем следующей частью
+  else if(!wantRec){ body.classList.remove('rec'); releaseWake(); showCue(fmtDur(Math.round(sessionMs/1000)), true); }
 }
 
 /* ====================== Авто-выгрузка на сервер расшифровки ======================
@@ -172,34 +226,51 @@ async function flushUploads(){
       if(r.up) continue; // уже выгружено
       try{
         const ext = (r.type.includes('webm')) ? 'webm' : 'm4a';
-        const qs = `?key=${encodeURIComponent(UPLOAD_KEY)}&ts=${r.ts}&dur=${r.dur}&ext=${ext}`;
+        const qs = `?key=${encodeURIComponent(UPLOAD_KEY)}&ts=${r.ts}&dur=${r.dur}&ext=${ext}&part=${r.part||1}`;
         const res = await fetch(UPLOAD_URL + qs, {
           method:'POST',
           headers:{ 'Content-Type': r.type || 'application/octet-stream' },
           body: r.blob,
         });
-        if(res.ok){ r.up = 1; await dbAdd(r); }   // помечаем выгруженной
+        // помечаем выгруженной — но только если её не удалили, пока шла выгрузка
+        if(res.ok){ const cur = await dbGet(r.id); if(cur){ cur.up = 1; await dbAdd(cur); } }
       }catch(e){ /* нет сети / сервер спит — попробуем позже */ }
     }
   }finally{ flushing = false; }
 }
-/* Досылаем недоотправленное при каждом открытии приложения и возврате из фона */
+/* Досылаем недоотправленное при каждом открытии приложения */
 window.addEventListener('load', ()=> setTimeout(flushUploads, 1500));
-document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') flushUploads(); });
 
-/* Не давать экрану гаснуть во время записи (иначе запись прервётся) */
+/* Не давать экрану гаснуть во время записи (иначе iOS заглушит микрофон).
+   Удерживает только от автоблокировки — кнопку «Питание» перебить нельзя. */
 async function requestWake(){
   try{ if('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); }catch(e){}
 }
 function releaseWake(){ try{ if(wakeLock){ wakeLock.release(); wakeLock=null; } }catch(e){} }
-document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible' && body.classList.contains('rec')) requestWake(); });
+
+/* Возврат на экран: досылаем очередь, заново берём wake lock и поднимаем
+   сессию, если её прервали, пока нас не было. */
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState !== 'visible') return;
+  flushUploads();
+  if(!wantRec) return;
+  requestWake();
+  if(!recorder || recorder.state === 'inactive') startRec(false);
+  else startWatchdog();  // поток мог умереть в фоне — watchdog это заметит за секунду
+});
 
 /* ====================== Жесты на экране-часах ====================== */
 const cue = document.getElementById('cue');
 let pressTimer=null, longFired=false, startXY=null;
 const clock = document.getElementById('clock');
 
-function showCue(txt){ cue.textContent = txt; cue.classList.add('show'); setTimeout(()=>cue.classList.remove('show'), 800); }
+/* num=true — показываем цифру (реально записанное время), она мельче значка */
+function showCue(txt, num){
+  cue.textContent = txt;
+  cue.classList.toggle('num', !!num);
+  cue.classList.add('show');
+  setTimeout(()=>cue.classList.remove('show'), num ? 1400 : 800);
+}
 function flashError(){ const dot=document.getElementById('dot'); dot.style.background='#7a1010'; dot.style.opacity='.9'; setTimeout(()=>{dot.style.opacity='0'; dot.style.background='#5a1212';},700); }
 
 clock.addEventListener('pointerdown', e=>{
@@ -211,9 +282,9 @@ clock.addEventListener('pointerup', e=>{
   if(longFired) return;
   const moved = startXY && (Math.abs(e.clientX-startXY[0])>16 || Math.abs(e.clientY-startXY[1])>16);
   if(moved) return;
-  // короткое касание — старт/стоп записи
-  if(body.classList.contains('rec')){ stopRec(); showCue('■'); }
-  else { startRec(); showCue('●'); }
+  // короткое касание — старт/стоп записи (после стопа сама покажет записанное время)
+  if(wantRec) stopRec();
+  else { startRec(true); showCue('●'); }
 });
 clock.addEventListener('pointercancel', ()=> clearTimeout(pressTimer));
 
@@ -234,8 +305,10 @@ async function openLib(){
     const url = URL.createObjectURL(r.blob);
     const el = document.createElement('div'); el.className='item';
     const flag = UPLOAD_URL ? (r.up ? '<span style="color:#4a8a5a">✓</span> ' : '<span style="color:#8a7a3a">↑</span> ') : '';
+    // часть > 1 = запись прерывалась (экран гас / микрофон отбирали) и продолжилась новым куском
+    const part = (r.part > 1) ? ` <span style="color:#8a7a3a">ч.${r.part}</span>` : '';
     el.innerHTML = `
-      <div class="top"><div class="title">${flag}${fmtTs(r.ts)}</div><div class="dur">${fmtDur(r.dur)}</div></div>
+      <div class="top"><div class="title">${flag}${fmtTs(r.ts)}${part}</div><div class="dur">${fmtDur(r.dur)}</div></div>
       <audio controls preload="none" src="${url}"></audio>
       <div class="actions">
         <button class="share">Сохранить / Отправить</button>
